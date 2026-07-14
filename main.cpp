@@ -1,223 +1,93 @@
 #include <iostream>
 #include <cstdio>
 #include <cstring>
+#include <vector>
+#include <string>
 
-/**
- * =================================================================================
- * TRABALHO PRÁTICO: MOTOR DE PERSISTÊNCIA COM LISTA DE ESPAÇOS DISPONÍVEIS (LED)
- * DISCIPLINA: Organização e Recuperação de Informação (ORI)
- * =================================================================================
- * 
- * Este programa demonstra a persistência de registros de tamanho fixo em disco,
- * contendo controle de remoção lógica e reaproveitamento de espaço por meio de
- * uma LED (Lista de Espaços Disponíveis) estruturada como Pilha LIFO (Last-In, First-Out).
- */
+#include "ativos.h"
+#include "arvore_b.hpp"
+#include "lista_invertida.hpp"
 
-// Garante o alinhamento de 1 byte para que a struct tenha exatamente o tamanho calculado,
-// evitando que o compilador adicione "padding" (preenchimento de bytes extras para alinhamento de memória).
-#pragma pack(push, 1)
-struct Ativo {
-    int patrimonio_id;         // 4 bytes (Chave Primária se >= 0, ou Ponteiro da LED se < 0)
-    char tipo_equipamento[20]; // 20 bytes (ex: "Notebook", "Monitor")
-    char setor_alocacao[20];   // 20 bytes (ex: "TI", "Financeiro")
-    char marca_modelo[40];     // 40 bytes (ex: "Dell Latitude 3420")
-    float valor_compra;        // 4 bytes (ex: 4500.50)
-};
-#pragma pack(pop)
-
-// Validação em tempo de compilação: 4 + 20 + 20 + 40 + 4 = 88 bytes.
+// Validação em tempo de compilação da struct Ativo
 static_assert(sizeof(Ativo) == 88, "A struct Ativo deve ter exatamente 88 bytes de tamanho fixo!");
 
-/**
- * ESTRATÉGIA DE CODIFICAÇÃO DA LED NO CAMPO patrimonio_id:
- * 
- * Para sabermos se um registro está ativo ou deletado na varredura sequencial, precisamos
- * que o 'patrimonio_id' de um registro deletado seja negativo.
- * Ao mesmo tempo, precisamos armazenar o RRN do próximo registro da LED (que pode ser 0, 1, 2, ... ou -1 para fim da lista).
- * 
- * Se simplesmente gravássemos o RRN positivo (ex: 2), um scan sequencial acharia que o registro está ativo com ID = 2.
- * Portanto, codificamos o próximo RRN de forma negativa usando a fórmula:
- * 
- *    patrimonio_id = -(proximo_rrn + 2)
- * 
- * Tabela de mapeamento:
- *  - Se proximo_rrn = -1 (fim da LED) -> patrimonio_id = -(-1 + 2) = -1
- *  - Se proximo_rrn = 0               -> patrimonio_id = -(0 + 2)  = -2
- *  - Se proximo_rrn = 1               -> patrimonio_id = -(1 + 2)  = -3
- *  - Se proximo_rrn = N               -> patrimonio_id = -(N + 2)
- * 
- * Assim:
- *  - Se patrimonio_id >= 0: O registro está ATIVO e este é o seu ID de patrimônio.
- *  - Se patrimonio_id < 0: O registro está DELETADO.
- *                          Para obter o próximo RRN da LED: proximo_rrn = -patrimonio_id - 2.
- */
+// --- FUNÇÕES DE SUPORTE A LOGICAL DELETION (LED) ---
 
-// Função auxiliar para verificar se um registro está logicamente removido
-bool esta_removido(const Ativo& a) {
+inline bool esta_removido(const Ativo& a) {
     return a.patrimonio_id < 0;
 }
 
-// Codifica o próximo RRN da LED para ser armazenado no patrimonio_id do registro deletado
-int codificar_proximo_rrn(int proximo_rrn) {
+inline int codificar_proximo_rrn(int proximo_rrn) {
     return -(proximo_rrn + 2);
 }
 
-// Decodifica o próximo RRN da LED a partir do patrimonio_id do registro deletado
-int decodificar_proximo_rrn(int patrimonio_id) {
+inline int decodificar_proximo_rrn(int patrimonio_id) {
     return -patrimonio_id - 2;
 }
 
-/**
- * 1. Inicializar Arquivo
- * Cria o arquivo caso não exista e inicializa o cabeçalho de 4 bytes (int) 
- * que guarda o topo da LED como -1.
- */
-void inicializar_arquivo(const char* nome_arquivo) {
-    // Tenta abrir para leitura e escrita binária ("rb+")
+// Inicializa o arquivo de dados com LED vazia (-1) caso não exista
+void inicializar_arquivo_dados(const char* nome_arquivo) {
     FILE* fp = fopen(nome_arquivo, "rb+");
-    
     if (!fp) {
-        // Se falhou, o arquivo provavelmente não existe. Vamos criá-lo com "wb+"
         fp = fopen(nome_arquivo, "wb+");
         if (!fp) {
-            std::perror("[Erro] Falha ao criar o arquivo de dados");
+            std::perror("[Erro] Falha ao criar arquivo de dados principal");
             return;
         }
-        
         int topo_inicial = -1;
-        // fseek não é necessário aqui pois o arquivo acabou de ser criado e está no offset 0.
-        // Gravamos 4 bytes contendo -1 para representar que a LED está vazia.
         fwrite(&topo_inicial, sizeof(int), 1, fp);
-        
-        std::cout << "[Inicializar] Arquivo '" << nome_arquivo << "' criado.\n";
-        std::cout << "              -> Cabecalho de 4 bytes gravado no offset 0 com valor: " << topo_inicial << " (LED Vazia)\n";
-    } else {
-        std::cout << "[Inicializar] Arquivo '" << nome_arquivo << "' ja existe. Pronto para operacoes.\n";
+        std::cout << "[Dados] Arquivo '" << nome_arquivo << "' inicializado com LED = -1.\n";
     }
-    
-    fclose(fp);
+    if (fp) fclose(fp);
 }
 
-/**
- * 2. Inserir Ativo
- * Checa o cabeçalho. Se a LED não estiver vazia (topo != -1), desempilha o RRN do topo,
- * atualiza o cabeçalho para apontar para o próximo RRN da pilha e sobrescreve o Ativo naquele espaço (Reaproveitamento O(1)).
- * Se a LED estiver vazia, grava o registro no final do arquivo físico.
- */
-void inserir_ativo(FILE* fp, Ativo novo_ativo) {
+// Insere um ativo no arquivo de dados reaproveitando espaço da LED (LIFO) ou gravando no final
+int inserir_ativo(FILE* fp, Ativo novo_ativo) {
     if (novo_ativo.patrimonio_id < 0) {
-        std::cout << "[Inserir] Erro: O ID do patrimonio deve ser maior ou igual a zero.\n";
-        return;
+        std::cout << "[Inserir] Erro: ID deve ser maior ou igual a zero.\n";
+        return -1;
     }
 
-    // 1. Ler o topo da LED no cabeçalho (offset 0)
     fseek(fp, 0, SEEK_SET); 
     int topo_led;
     fread(&topo_led, sizeof(int), 1, fp);
     
-    std::cout << "[Inserir] Lendo cabecalho no offset 0. Topo da LED = " << topo_led << "\n";
+    int rrn_gravado = -1;
 
     if (topo_led != -1) {
-        // --- CASO 1: Reaproveitar espaço (LED não está vazia) ---
-        // O topo_led nos dá o RRN (Relative Record Number) do registro logicamente removido.
-        int rrn_reaproveitado = topo_led;
+        // reaproveita espaço da LED
+        rrn_gravado = topo_led;
+        long offset_registro = sizeof(int) + rrn_gravado * sizeof(Ativo);
         
-        // Calcula o offset do registro que será reaproveitado:
-        // Cabeçalho (4 bytes) + (RRN * tamanho do registro)
-        long offset_registro = sizeof(int) + rrn_reaproveitado * sizeof(Ativo);
-        
-        // Movemos o cursor para ler o registro deletado e obter o próximo RRN da LED
         fseek(fp, offset_registro, SEEK_SET);
         Ativo registro_deletado;
         fread(&registro_deletado, sizeof(Ativo), 1, fp);
         
-        // Decodificamos o próximo RRN guardado no patrimonio_id do registro deletado
         int proximo_rrn = decodificar_proximo_rrn(registro_deletado.patrimonio_id);
         
-        // Movemos o cursor de volta ao início deste slot para escrever o novo ativo por cima
         fseek(fp, offset_registro, SEEK_SET);
         fwrite(&novo_ativo, sizeof(Ativo), 1, fp);
         
-        // Atualizamos o cabeçalho do arquivo para apontar para o próximo RRN da LED
         fseek(fp, 0, SEEK_SET);
         fwrite(&proximo_rrn, sizeof(int), 1, fp);
         
-        std::cout << "[Inserir] REAPROVEITAMENTO no RRN " << rrn_reaproveitado << " (offset " << offset_registro << " bytes).\n";
-        std::cout << "          -> Proximo RRN da LED desempilhado: " << proximo_rrn << " (gravado no cabecalho).\n";
+        std::cout << "[Dados] Reaproveitando RRN " << rrn_gravado << " da LED (novo topo: RRN " << proximo_rrn << ").\n";
     } else {
-        // --- CASO 2: Gravar no final do arquivo (LED vazia) ---
-        // Posiciona o ponteiro no final do arquivo físico
+        // insere no final do arquivo
         fseek(fp, 0, SEEK_END);
-        long offset_fim = ftell(fp); // Pega a posição atual do ponteiro (tamanho total do arquivo em bytes)
+        long offset_fim = ftell(fp);
+        rrn_gravado = (offset_fim - sizeof(int)) / sizeof(Ativo);
         
-        // Calcula qual será o RRN desse novo registro
-        int rrn_novo = (offset_fim - sizeof(int)) / sizeof(Ativo);
-        
-        // Escreve o novo registro no fim do arquivo
         fwrite(&novo_ativo, sizeof(Ativo), 1, fp);
-        
-        std::cout << "[Inserir] FIM DO ARQUIVO no RRN " << rrn_novo << " (offset " << offset_fim << " bytes).\n";
+        std::cout << "[Dados] Gravado no FIM DO ARQUIVO no RRN " << rrn_gravado << ".\n";
     }
     
-    // Força a escrita dos buffers do sistema operacional para o disco físico
     fflush(fp);
+    return rrn_gravado;
 }
 
-/**
- * 3. Buscar Ativo Sequencial
- * Realiza uma varredura sequencial direta no disco em busca do Ativo com o patrimonio_id correspondente,
- * pulando registros que estão logicamente deletados.
- */
-Ativo buscar_ativo_sequencial(FILE* fp, int id_alvo) {
-    // Posiciona o ponteiro logo após o cabeçalho (offset de 4 bytes)
-    fseek(fp, sizeof(int), SEEK_SET);
-    
-    Ativo reg;
-    int rrn = 0;
-    
-    std::cout << "[Buscar] Iniciando varredura sequencial a partir do offset " << sizeof(int) << "...\n";
-    
-    // Lê registro por registro sequencialmente até o fim do arquivo
-    while (fread(&reg, sizeof(Ativo), 1, fp) == 1) {
-        long offset_atual = sizeof(int) + rrn * sizeof(Ativo);
-        
-        // Se o registro não estiver deletado e o ID coincidir com o alvo
-        if (!esta_removido(reg)) {
-            if (reg.patrimonio_id == id_alvo) {
-                std::cout << "[Buscar] SUCESSO: Ativo com ID " << id_alvo << " encontrado no RRN " << rrn 
-                          << " (offset " << offset_atual << " bytes).\n";
-                return reg;
-            }
-        } else {
-            // Depuração pedagógica mostrando que o registro deletado foi pulado
-            int prox = decodificar_proximo_rrn(reg.patrimonio_id);
-            std::cout << "[Buscar] Ignorando registro deletado no RRN " << rrn 
-                      << " (Ponteiro LED: RRN " << prox << ").\n";
-        }
-        rrn++;
-    }
-    
-    std::cout << "[Buscar] AVISO: Ativo com ID " << id_alvo << " nao encontrado no arquivo.\n";
-    
-    // Retorna uma struct sentinela com patrimonio_id = -999 para indicar "não encontrado"
-    Ativo nao_encontrado;
-    nao_encontrado.patrimonio_id = -999;
-    std::memset(nao_encontrado.tipo_equipamento, 0, sizeof(nao_encontrado.tipo_equipamento));
-    std::memset(nao_encontrado.setor_alocacao, 0, sizeof(nao_encontrado.setor_alocacao));
-    std::memset(nao_encontrado.marca_modelo, 0, sizeof(nao_encontrado.marca_modelo));
-    nao_encontrado.valor_compra = 0.0f;
-    
-    return nao_encontrado;
-}
-
-/**
- * 4. Remover Ativo Lógico
- * Localiza o registro. Aplica a remoção lógica. Lê o antigo topo da LED no cabeçalho
- * e faz o campo 'patrimonio_id' deste registro recém-removido apontar para ele (codificado).
- * Atualiza o cabeçalho do arquivo para que o topo aponte para o RRN deste novo buraco (Estratégia LIFO Pilha O(1)).
- */
-void remover_ativo_logico(FILE* fp, int id_alvo) {
-    // 1. Localizar o RRN do registro a ser removido (Varredura Sequencial)
+// Remove logicamente o ativo em disco colocando-o no topo da pilha LIFO da LED
+int remover_ativo_logico(FILE* fp, int id_alvo) {
     fseek(fp, sizeof(int), SEEK_SET);
     Ativo reg;
     int rrn_alvo = -1;
@@ -232,51 +102,45 @@ void remover_ativo_logico(FILE* fp, int id_alvo) {
     }
     
     if (rrn_alvo == -1) {
-        std::cout << "[Remover] Erro: Ativo com ID " << id_alvo << " nao encontrado ou ja removido.\n";
-        return;
+        return -1; // Não encontrado
     }
     
-    // 2. Ler o cabeçalho para obter o antigo topo da LED
     fseek(fp, 0, SEEK_SET);
     int antigo_topo;
     fread(&antigo_topo, sizeof(int), 1, fp);
     
-    // 3. Preparar o registro para a remoção lógica
-    // O campo patrimonio_id passará a guardar o antigo_topo codificado de forma negativa
     reg.patrimonio_id = codificar_proximo_rrn(antigo_topo);
-    
-    // Opcional: Limpar os outros campos para melhor controle visual ou segurança dos dados
     std::strcpy(reg.tipo_equipamento, "[DELETADO]");
     std::strcpy(reg.setor_alocacao, "[LED]");
     std::strcpy(reg.marca_modelo, "[DISPONIVEL]");
     reg.valor_compra = 0.0f;
     
-    // 4. Gravar o registro modificado de volta no mesmo RRN
     long offset_registro = sizeof(int) + rrn_alvo * sizeof(Ativo);
     fseek(fp, offset_registro, SEEK_SET);
     fwrite(&reg, sizeof(Ativo), 1, fp);
     
-    // 5. Atualizar o cabeçalho do arquivo para que o topo aponte para o RRN do registro removido (rrn_alvo)
     fseek(fp, 0, SEEK_SET);
     fwrite(&rrn_alvo, sizeof(int), 1, fp);
     
-    // Garante gravação imediata
     fflush(fp);
-    
-    std::cout << "[Remover] SUCESSO: Registro ID " << id_alvo << " no RRN " << rrn_alvo << " foi removido logicamente.\n";
-    std::cout << "          -> O campo patrimonio_id do RRN " << rrn_alvo << " agora aponta para o antigo topo: RRN " << antigo_topo << ".\n";
-    std::cout << "          -> O cabecalho do arquivo foi atualizado para apontar para o novo topo: RRN " << rrn_alvo << ".\n";
+    std::cout << "[Dados] Registro ID " << id_alvo << " no RRN " << rrn_alvo << " removido logicamente.\n";
+    return rrn_alvo;
 }
 
-/**
- * Função Auxiliar de Visualização (Depuração)
- * Varre todo o arquivo físico mostrando o cabeçalho e cada bloco de registro
- * no disco, permitindo acompanhar didaticamente o funcionamento da LED.
- */
-void depurar_arquivo(const char* nome_arquivo) {
+// Imprime a formatação visual de um Ativo
+void imprimir_ativo(const Ativo &a) {
+    std::cout << "Patrimonio : " << a.patrimonio_id << "\n";
+    std::cout << "Tipo       : " << a.tipo_equipamento << "\n";
+    std::cout << "Setor      : " << a.setor_alocacao << "\n";
+    std::cout << "Marca      : " << a.marca_modelo << "\n";
+    std::cout << "Valor      : R$ " << a.valor_compra << "\n\n";
+}
+
+// Depura sequencialmente o arquivo físico de dados mostrando a LED
+void depurar_arquivo_dados(const char* nome_arquivo) {
     FILE* fp = fopen(nome_arquivo, "rb");
     if (!fp) {
-        std::cout << "[Depuracao] Nao foi possivel abrir o arquivo para leitura.\n";
+        std::cout << "[Depuracao] Nao foi possivel abrir o arquivo de dados.\n";
         return;
     }
     
@@ -311,98 +175,496 @@ void depurar_arquivo(const char* nome_arquivo) {
         rrn++;
     }
     std::cout << "========================================================================\n\n";
-    
     fclose(fp);
 }
 
-// Helper para criar um objeto Ativo de forma limpa
-Ativo criar_ativo(int id, const char* tipo, const char* setor, const char* marca, float valor) {
+// Varre o arquivo sequencialmente imprimindo apenas ativos que estão online
+void listar_ativos(FILE *fp) {
+    fseek(fp, sizeof(int), SEEK_SET);
     Ativo a;
-    a.patrimonio_id = id;
-    std::strncpy(a.tipo_equipamento, tipo, sizeof(a.tipo_equipamento) - 1);
-    a.tipo_equipamento[sizeof(a.tipo_equipamento) - 1] = '\0'; // Garante terminação nula
-    
-    std::strncpy(a.setor_alocacao, setor, sizeof(a.setor_alocacao) - 1);
-    a.setor_alocacao[sizeof(a.setor_alocacao) - 1] = '\0';
-    
-    std::strncpy(a.marca_modelo, marca, sizeof(a.marca_modelo) - 1);
-    a.marca_modelo[sizeof(a.marca_modelo) - 1] = '\0';
-    
-    a.valor_compra = valor;
-    return a;
+    std::cout << "\n========== ATIVOS NO SISTEMA ==========\n";
+    int count = 0;
+    while (fread(&a, sizeof(Ativo), 1, fp) == 1) {
+        if (a.patrimonio_id >= 0) {
+            imprimir_ativo(a);
+            std::cout << "-----------------------------\n";
+            count++;
+        }
+    }
+    if (count == 0) {
+        std::cout << "(Nenhum ativo cadastrado no sistema)\n";
+    }
 }
+
+// --- INTEGRAÇÃO DO CRUD COMPLETO ---
+
+void cadastrar_ativo_completo(FILE* fpDados, FILE* fpIndice, 
+                              const char* fSecTipo, const char* fLstTipo,
+                              const char* fSecSetor, const char* fLstSetor,
+                              Ativo novo) 
+{
+    // 1. Validar unicidade da Chave Primária via Árvore B
+    fseek(fpIndice, 0, SEEK_SET);
+    int rrn_raiz;
+    fread(&rrn_raiz, sizeof(int), 1, fpIndice);
+    
+    int rrn_existente = buscar_na_arvore_b(fpIndice, rrn_raiz, novo.patrimonio_id);
+    if (rrn_existente != -1) {
+        std::cout << "[Erro] Ja existe um ativo cadastrado com o ID " << novo.patrimonio_id << ".\n";
+        return;
+    }
+
+    // 2. Inserir no arquivo de dados (reaproveita LED se houver)
+    int rrn_dados = inserir_ativo(fpDados, novo);
+    if (rrn_dados == -1) return;
+
+    // 3. Atualizar índice primário da Árvore B
+    inserir_na_arvore_b(fpIndice, novo.patrimonio_id, rrn_dados);
+
+    // 4. Atualizar índices secundários de Lista Invertida
+    inserir_indice_secundario(fSecTipo, fLstTipo, novo.tipo_equipamento, novo.patrimonio_id);
+    inserir_indice_secundario(fSecSetor, fLstSetor, novo.setor_alocacao, novo.patrimonio_id);
+    
+    std::cout << "\nAtivo cadastrado com sucesso no RRN " << rrn_dados << "!\n";
+}
+
+void remover_ativo_completo(FILE* fpDados, FILE* fpIndice,
+                            const char* fSecTipo, const char* fLstTipo,
+                            const char* fSecSetor, const char* fLstSetor,
+                            int id) 
+{
+    // 1. Procurar na Árvore B
+    fseek(fpIndice, 0, SEEK_SET);
+    int rrn_raiz;
+    fread(&rrn_raiz, sizeof(int), 1, fpIndice);
+    
+    int rrn_dados = buscar_na_arvore_b(fpIndice, rrn_raiz, id);
+    if (rrn_dados == -1) {
+        std::cout << "[Erro] Ativo com ID " << id << " nao encontrado ou ja removido.\n";
+        return;
+    }
+
+    // 2. Ler o registro do arquivo de dados para obter campos secundários
+    long offset = sizeof(int) + rrn_dados * sizeof(Ativo);
+    fseek(fpDados, offset, SEEK_SET);
+    Ativo reg;
+    if (fread(&reg, sizeof(Ativo), 1, fpDados) != 1 || esta_removido(reg)) {
+        std::cout << "[Erro] Falha ao ler registro de dados.\n";
+        return;
+    }
+
+    // 3. Remover logicamente do arquivo de dados (insere na LED)
+    int rrn_removido = remover_ativo_logico(fpDados, id);
+    if (rrn_removido == -1) return;
+
+    // 4. Remover logicamente do índice primário da Árvore B (rrn_dados = -1)
+    remover_logico_arvore_b(fpIndice, id);
+
+    // 5. Remover dos índices secundários
+    remover_indice_secundario(fSecTipo, fLstTipo, reg.tipo_equipamento, id);
+    remover_indice_secundario(fSecSetor, fLstSetor, reg.setor_alocacao, id);
+    
+    std::cout << "\nAtivo ID " << id << " removido logicamente com sucesso.\n";
+}
+
+void atualizar_ativo_completo(FILE* fpDados, FILE* fpIndice,
+                              const char* fSecTipo, const char* fLstTipo,
+                              const char* fSecSetor, const char* fLstSetor,
+                              int id) 
+{
+    // 1. Procurar na Árvore B
+    fseek(fpIndice, 0, SEEK_SET);
+    int rrn_raiz;
+    fread(&rrn_raiz, sizeof(int), 1, fpIndice);
+    
+    int rrn_dados = buscar_na_arvore_b(fpIndice, rrn_raiz, id);
+    if (rrn_dados == -1) {
+        std::cout << "[Erro] Ativo com ID " << id << " nao encontrado ou ja removido.\n";
+        return;
+    }
+
+    // 2. Ler o registro
+    long offset = sizeof(int) + rrn_dados * sizeof(Ativo);
+    fseek(fpDados, offset, SEEK_SET);
+    Ativo antigo;
+    if (fread(&antigo, sizeof(Ativo), 1, fpDados) != 1 || esta_removido(antigo)) {
+        std::cout << "[Erro] Falha ao acessar registro de dados.\n";
+        return;
+    }
+
+    Ativo novo = antigo; // ID é imutável
+
+    std::cin.ignore();
+    std::cout << "Novo Tipo [" << antigo.tipo_equipamento << "]: ";
+    char temp[40];
+    std::cin.getline(temp, 40);
+    if (std::strlen(temp) > 0) {
+        std::strncpy(novo.tipo_equipamento, temp, 19);
+        novo.tipo_equipamento[19] = '\0';
+    }
+
+    std::cout << "Novo Setor [" << antigo.setor_alocacao << "]: ";
+    std::cin.getline(temp, 40);
+    if (std::strlen(temp) > 0) {
+        std::strncpy(novo.setor_alocacao, temp, 19);
+        novo.setor_alocacao[19] = '\0';
+    }
+
+    std::cout << "Nova Marca/Modelo [" << antigo.marca_modelo << "]: ";
+    std::cin.getline(temp, 40);
+    if (std::strlen(temp) > 0) {
+        std::strncpy(novo.marca_modelo, temp, 39);
+        novo.marca_modelo[39] = '\0';
+    }
+
+    std::cout << "Novo Valor [" << antigo.valor_compra << "]: ";
+    std::cin.getline(temp, 40);
+    if (std::strlen(temp) > 0) {
+        try {
+            novo.valor_compra = std::stof(temp);
+        } catch(...) {
+            std::cout << "[Aviso] Valor invalido. Mantendo antigo.\n";
+        }
+    }
+
+    // 3. Escrever novo registro de volta
+    fseek(fpDados, offset, SEEK_SET);
+    fwrite(&novo, sizeof(Ativo), 1, fpDados);
+    fflush(fpDados);
+
+    // 4. Se mudou de Tipo, atualiza o índice secundário
+    if (std::strcmp(antigo.tipo_equipamento, novo.tipo_equipamento) != 0) {
+        remover_indice_secundario(fSecTipo, fLstTipo, antigo.tipo_equipamento, id);
+        inserir_indice_secundario(fSecTipo, fLstTipo, novo.tipo_equipamento, id);
+    }
+
+    // 5. Se mudou de Setor, atualiza o índice secundário
+    if (std::strcmp(antigo.setor_alocacao, novo.setor_alocacao) != 0) {
+        remover_indice_secundario(fSecSetor, fLstSetor, antigo.setor_alocacao, id);
+        inserir_indice_secundario(fSecSetor, fLstSetor, novo.setor_alocacao, id);
+    }
+
+    std::cout << "\nAtivo ID " << id << " atualizado com sucesso!\n";
+}
+
+// --- DESAFIO DO CHEFÃO: VACUUM (DESFRAGMENTADOR E COMPACTADOR) ---
+
+void vacuum_defragmentar(
+    const char* nome_dados, 
+    const char* nome_indice,
+    const char* fSecTipo, const char* fLstTipo,
+    const char* fSecSetor, const char* fLstSetor) 
+{
+    std::cout << "\n[Vacuum] Iniciando desfragmentacao fisica do disco...\n";
+    
+    FILE* fpDados = fopen(nome_dados, "rb");
+    if (!fpDados) {
+        std::cout << "[Vacuum] Erro: Arquivo de dados original nao encontrado.\n";
+        return;
+    }
+    
+    const char* temp_dados = "ativos_inventario_temp.bin";
+    const char* temp_indice = "ativos_index_temp.btree";
+    
+    FILE* fpDadosTemp = fopen(temp_dados, "wb+");
+    if (!fpDadosTemp) {
+        std::cout << "[Vacuum] Erro ao criar arquivo de dados temporario.\n";
+        fclose(fpDados);
+        return;
+    }
+    // Inicializa cabeçalho com LED vazia (-1)
+    int topo_inicial = -1;
+    fwrite(&topo_inicial, sizeof(int), 1, fpDadosTemp);
+    
+    // Inicializa nova Árvore B temporária
+    inicializar_arvore_b(temp_indice);
+    FILE* fpIndiceTemp = fopen(temp_indice, "rb+");
+    if (!fpIndiceTemp) {
+        std::cout << "[Vacuum] Erro ao criar indice temporario.\n";
+        fclose(fpDados);
+        fclose(fpDadosTemp);
+        return;
+    }
+    
+    // Reconstruímos também os índices secundários de tipo e setor limpos de fragmentação
+    const char* temp_sec_tipo = "tipo_secundario_temp.idx";
+    const char* temp_lst_tipo = "tipo_lista_temp.bin";
+    const char* temp_sec_setor = "setor_secundario_temp.idx";
+    const char* temp_lst_setor = "setor_lista_temp.bin";
+    
+    inicializar_indice_secundario(temp_sec_tipo, temp_lst_tipo);
+    inicializar_indice_secundario(temp_sec_setor, temp_lst_setor);
+    
+    // Varre o arquivo original a partir do offset 4
+    fseek(fpDados, sizeof(int), SEEK_SET);
+    Ativo reg;
+    int rrn_novo = 0;
+    int total_copiados = 0;
+    
+    while (fread(&reg, sizeof(Ativo), 1, fpDados) == 1) {
+        if (reg.patrimonio_id >= 0) { // Se estiver ativo
+            // Escreve no arquivo temporário
+            fseek(fpDadosTemp, sizeof(int) + rrn_novo * sizeof(Ativo), SEEK_SET);
+            fwrite(&reg, sizeof(Ativo), 1, fpDadosTemp);
+            
+            // Grava na nova Árvore B
+            inserir_na_arvore_b(fpIndiceTemp, reg.patrimonio_id, rrn_novo);
+            
+            // Re-insere nas listas invertidas temporárias
+            inserir_indice_secundario(temp_sec_tipo, temp_lst_tipo, reg.tipo_equipamento, reg.patrimonio_id);
+            inserir_indice_secundario(temp_sec_setor, temp_lst_setor, reg.setor_alocacao, reg.patrimonio_id);
+            
+            rrn_novo++;
+            total_copiados++;
+        }
+    }
+    
+    fclose(fpDados);
+    fclose(fpDadosTemp);
+    fclose(fpIndiceTemp);
+    
+    // Substitui arquivos antigos
+    std::remove(nome_dados);
+    std::remove(nome_indice);
+    std::remove(fSecTipo);
+    std::remove(fLstTipo);
+    std::remove(fSecSetor);
+    std::remove(fLstSetor);
+    
+    std::rename(temp_dados, nome_dados);
+    std::rename(temp_indice, nome_indice);
+    std::rename(temp_sec_tipo, fSecTipo);
+    std::rename(temp_lst_tipo, fLstTipo);
+    std::rename(temp_sec_setor, fSecSetor);
+    std::rename(temp_lst_setor, fLstSetor);
+    
+    std::cout << "[Vacuum] Compactacao concluida com SUCESSO!\n";
+    std::cout << "         " << total_copiados << " registros ativos copiados. LED zerada e indices reconstruidos.\n";
+}
+
+// --- FUNÇÃO MAIN COM MENU CLI INTERATIVO ---
 
 int main() {
-    const char* nome_arquivo = "ativos_inventario.bin";
+    const char* arquivo_dados = "ativos_inventario.bin";
+    const char* arquivo_indice = "ativos_index.btree";
     
-    std::cout << "=========================================================\n";
-    std::cout << "     TESTE DO MOTOR DE PERSISTENCIA COM LED (LIFO)       \n";
-    std::cout << "=========================================================\n\n";
+    const char* sec_tipo = "tipo_secundario.idx";
+    const char* lst_tipo = "tipo_lista.bin";
     
-    // Removendo arquivo anterior se houver para começar o teste do zero
-    std::remove(nome_arquivo);
-    
-    // 1. Inicialização do arquivo
-    inicializar_arquivo(nome_arquivo);
-    
-    // Abrindo o arquivo para manipulação
-    FILE* fp = fopen(nome_arquivo, "rb+");
-    if (!fp) {
-        std::cerr << "Erro ao abrir o arquivo para testes.\n";
+    const char* sec_setor = "setor_secundario.idx";
+    const char* lst_setor = "setor_lista.bin";
+
+    // Inicialização dos arquivos físicos de armazenamento e índices
+    inicializar_arquivo_dados(arquivo_dados);
+    inicializar_arvore_b(arquivo_indice);
+    inicializar_indice_secundario(sec_tipo, lst_tipo);
+    inicializar_indice_secundario(sec_setor, lst_setor);
+
+    FILE* fpDados = fopen(arquivo_dados, "rb+");
+    FILE* fpIndice = fopen(arquivo_indice, "rb+");
+
+    if (!fpDados || !fpIndice) {
+        std::cout << "[Erro] Falha catastrófica ao abrir arquivos do SGBD.\n";
         return 1;
     }
-    
-    // Depuração inicial
-    depurar_arquivo(nome_arquivo);
-    
-    // 2. Inserindo 3 Ativos
-    std::cout << ">>> PASSO 1: Inserindo 3 Ativos iniciais (LED vazia) <<<\n";
-    inserir_ativo(fp, criar_ativo(101, "Notebook", "TI", "Dell Latitude 3420", 4500.00f));
-    inserir_ativo(fp, criar_ativo(102, "Monitor", "RH", "LG UltraWide 29", 1200.50f));
-    inserir_ativo(fp, criar_ativo(103, "Servidor", "Infra", "HP ProLiant DL380", 25000.00f));
-    
-    depurar_arquivo(nome_arquivo);
-    
-    // 3. Teste de Busca Sequencial
-    std::cout << ">>> PASSO 2: Buscando Ativo ID 102 <<<\n";
-    Ativo busca1 = buscar_ativo_sequencial(fp, 102);
-    if (busca1.patrimonio_id != -999) {
-        std::cout << "Resultado da busca -> ID: " << busca1.patrimonio_id << ", Marca: " << busca1.marca_modelo << "\n\n";
-    }
-    
-    // 4. Teste de Remoção Lógica (LIFO)
-    std::cout << ">>> PASSO 3: Removendo logicamente o Monitor (ID 102, RRN 1) <<<\n";
-    remover_ativo_logico(fp, 102);
-    depurar_arquivo(nome_arquivo);
-    
-    std::cout << ">>> PASSO 4: Removendo logicamente o Notebook (ID 101, RRN 0) <<<\n";
-    remover_ativo_logico(fp, 101);
-    depurar_arquivo(nome_arquivo);
-    
-    // Veja que o topo da LED agora aponta para o RRN 0, e o RRN 0 aponta para o RRN 1, que aponta para -1 (fim).
-    // Ou seja: LED -> RRN 0 -> RRN 1 -> Fim (-1).
-    
-    // 5. Teste de Reaproveitamento de Espaço (LED)
-    std::cout << ">>> PASSO 5: Inserindo novo Ativo (ID 104 - Teclado) para testar o reaproveitamento <<<\n";
-    // O novo registro deve ocupar o topo da LED, que é o RRN 0 (Notebook deletado).
-    // O topo da LED deve então passar a apontar para RRN 1.
-    inserir_ativo(fp, criar_ativo(104, "Teclado", "Financeiro", "Logitech MX Keys", 600.00f));
-    depurar_arquivo(nome_arquivo);
-    
-    std::cout << ">>> PASSO 6: Inserindo mais um Ativo (ID 105 - Mouse) <<<\n";
-    // O novo registro deve ocupar o RRN 1 (Monitor deletado).
-    // O topo da LED deve voltar a ser -1 (vazia).
-    inserir_ativo(fp, criar_ativo(105, "Mouse", "Vendas", "Logitech MX Master", 450.00f));
-    depurar_arquivo(nome_arquivo);
-    
-    std::cout << ">>> PASSO 7: Inserindo Ativo (ID 106 - Switch) com a LED ja vazia <<<\n";
-    // Como a LED está vazia (-1), este registro deve ser inserido no final do arquivo (RRN 3).
-    inserir_ativo(fp, criar_ativo(106, "Switch", "TI", "Cisco Catalyst 24P", 8000.00f));
-    depurar_arquivo(nome_arquivo);
 
-    // 6. Fechando o arquivo
-    fclose(fp);
-    std::cout << "Programa de teste encerrado com sucesso. Arquivos gravados no disco.\n";
-    
+    int opcao = -1;
+    while (opcao != 0) {
+        std::cout << "\n";
+        std::cout << "=========================================\n";
+        std::cout << "     SGBD: RASTREAMENTO DE ATIVOS TI     \n";
+        std::cout << "=========================================\n";
+        std::cout << "1 - Cadastrar ativo\n";
+        std::cout << "2 - Buscar ativo por ID (Arvore B)\n";
+        std::cout << "3 - Buscar ativos por Tipo (Lista Invertida)\n";
+        std::cout << "4 - Buscar ativos por Setor (Lista Invertida)\n";
+        std::cout << "5 - Atualizar ativo (Chave ID imutavel)\n";
+        std::cout << "6 - Remover ativo (LED / LIFO)\n";
+        std::cout << "7 - Listar todos os ativos\n";
+        std::cout << "8 - Mostrar arquivo de dados (LED visual)\n";
+        std::cout << "9 - Mostrar Arvore B (Estrutura hierarquica)\n";
+        std::cout << "10 - Compactar arquivos (Vacuum / Defragmentar)\n";
+        std::cout << "0 - Sair\n";
+        std::cout << "Opcao: ";
+
+        std::cin >> opcao;
+        if (std::cin.fail()) {
+            std::cin.clear();
+            std::cin.ignore(1000, '\n');
+            std::cout << "\nOpcao invalida. Digite um numero.\n";
+            continue;
+        }
+
+        switch (opcao) {
+            case 1: {
+                Ativo novo;
+                std::cout << "\nPatrimonio ID: ";
+                std::cin >> novo.patrimonio_id;
+                if (std::cin.fail() || novo.patrimonio_id < 0) {
+                    std::cin.clear();
+                    std::cin.ignore(1000, '\n');
+                    std::cout << "[Erro] ID deve ser um numero inteiro positivo.\n";
+                    break;
+                }
+                std::cin.ignore();
+
+                std::cout << "Tipo Equipamento: ";
+                std::cin.getline(novo.tipo_equipamento, 20);
+
+                std::cout << "Setor Alocacao: ";
+                std::cin.getline(novo.setor_alocacao, 20);
+
+                std::cout << "Marca/Modelo: ";
+                std::cin.getline(novo.marca_modelo, 40);
+
+                std::cout << "Valor Compra: ";
+                std::cin >> novo.valor_compra;
+
+                cadastrar_ativo_completo(fpDados, fpIndice, sec_tipo, lst_tipo, sec_setor, lst_setor, novo);
+                break;
+            }
+
+            case 2: {
+                int id;
+                std::cout << "\nDigite o Patrimonio ID para busca: ";
+                std::cin >> id;
+                
+                fseek(fpIndice, 0, SEEK_SET);
+                int rrn_raiz;
+                fread(&rrn_raiz, sizeof(int), 1, fpIndice);
+                
+                int rrn = buscar_na_arvore_b(fpIndice, rrn_raiz, id);
+                if (rrn != -1) {
+                    long offset = sizeof(int) + rrn * sizeof(Ativo);
+                    fseek(fpDados, offset, SEEK_SET);
+                    Ativo a;
+                    if (fread(&a, sizeof(Ativo), 1, fpDados) == 1 && !esta_removido(a)) {
+                        std::cout << "\n--- REGISTRO ENCONTRADO (RRN " << rrn << ") ---\n";
+                        imprimir_ativo(a);
+                    } else {
+                        std::cout << "\n[Erro] Registro apontado no indice nao esta ativo.\n";
+                    }
+                } else {
+                    std::cout << "\nAtivo nao encontrado via Arvore B.\n";
+                }
+                break;
+            }
+
+            case 3: {
+                std::cin.ignore();
+                std::cout << "\nDigite o Tipo de Equipamento (ex: Notebook): ";
+                char tipo_alvo[20];
+                std::cin.getline(tipo_alvo, 20);
+
+                std::vector<int> ids = buscar_indice_secundario(sec_tipo, lst_tipo, tipo_alvo);
+                std::cout << "\n--- ATIVOS ENCONTRADOS PARA O TIPO '" << tipo_alvo << "' ---\n";
+                int count = 0;
+                for (int id : ids) {
+                    fseek(fpIndice, 0, SEEK_SET);
+                    int rrn_raiz;
+                    fread(&rrn_raiz, sizeof(int), 1, fpIndice);
+                    
+                    int rrn = buscar_na_arvore_b(fpIndice, rrn_raiz, id);
+                    if (rrn != -1) {
+                        fseek(fpDados, sizeof(int) + rrn * sizeof(Ativo), SEEK_SET);
+                        Ativo a;
+                        if (fread(&a, sizeof(Ativo), 1, fpDados) == 1 && !esta_removido(a)) {
+                            imprimir_ativo(a);
+                            count++;
+                        }
+                    }
+                }
+                if (count == 0) {
+                    std::cout << "(Nenhum ativo localizado para esta pesquisa)\n";
+                }
+                break;
+            }
+
+            case 4: {
+                std::cin.ignore();
+                std::cout << "\nDigite o Setor de Alocacao (ex: TI): ";
+                char setor_alvo[20];
+                std::cin.getline(setor_alvo, 20);
+
+                std::vector<int> ids = buscar_indice_secundario(sec_setor, lst_setor, setor_alvo);
+                std::cout << "\n--- ATIVOS ENCONTRADOS PARA O SETOR '" << setor_alvo << "' ---\n";
+                int count = 0;
+                for (int id : ids) {
+                    fseek(fpIndice, 0, SEEK_SET);
+                    int rrn_raiz;
+                    fread(&rrn_raiz, sizeof(int), 1, fpIndice);
+                    
+                    int rrn = buscar_na_arvore_b(fpIndice, rrn_raiz, id);
+                    if (rrn != -1) {
+                        fseek(fpDados, sizeof(int) + rrn * sizeof(Ativo), SEEK_SET);
+                        Ativo a;
+                        if (fread(&a, sizeof(Ativo), 1, fpDados) == 1 && !esta_removido(a)) {
+                            imprimir_ativo(a);
+                            count++;
+                        }
+                    }
+                }
+                if (count == 0) {
+                    std::cout << "(Nenhum ativo localizado para esta pesquisa)\n";
+                }
+                break;
+            }
+
+            case 5: {
+                int id;
+                std::cout << "\nDigite o ID do Ativo a atualizar: ";
+                std::cin >> id;
+                atualizar_ativo_completo(fpDados, fpIndice, sec_tipo, lst_tipo, sec_setor, lst_setor, id);
+                break;
+            }
+
+            case 6: {
+                int id;
+                std::cout << "\nDigite o ID do Ativo a remover: ";
+                std::cin >> id;
+                remover_ativo_completo(fpDados, fpIndice, sec_tipo, lst_tipo, sec_setor, lst_setor, id);
+                break;
+            }
+
+            case 7: {
+                listar_ativos(fpDados);
+                break;
+            }
+
+            case 8: {
+                depurar_arquivo_dados(arquivo_dados);
+                break;
+            }
+
+            case 9: {
+                depurar_arvore_b(arquivo_indice);
+                break;
+            }
+
+            case 10: {
+                // Para rodar o Vacuum, precisamos fechar os descritores de arquivo abertos
+                fclose(fpDados);
+                fclose(fpIndice);
+                
+                vacuum_defragmentar(arquivo_dados, arquivo_indice, sec_tipo, lst_tipo, sec_setor, lst_setor);
+                
+                // Reabrir os descritores
+                fpDados = fopen(arquivo_dados, "rb+");
+                fpIndice = fopen(arquivo_indice, "rb+");
+                break;
+            }
+
+            case 0:
+                std::cout << "\nFinalizando o sistema...\n";
+                break;
+
+            default:
+                std::cout << "\nOpcao invalida. Escolha novamente.\n";
+                break;
+        }
+    }
+
+    fclose(fpDados);
+    fclose(fpIndice);
     return 0;
 }
