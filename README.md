@@ -1,89 +1,96 @@
 # Sistema de Rastreamento de Ativos e Inventário de TI
 
-Este repositório contém a implementação completa da camada de persistência e indexação de dados para um **Sistema de Rastreamento de Ativos e Inventário de TI**. O projeto foi desenvolvido "do zero" em C++, em conformidade com as restrições acadêmicas da disciplina de **Organização e Recuperação de Informação (ORI)**, sem a utilização de banco de dados ou serializadores prontos.
+Este repositório contém a implementação completa da persistência física e indexação para o **Sistema de Rastreamento de Ativos e Inventário de TI**. O projeto foi desenvolvido totalmente em C++ para a disciplina de **Organização e Recuperação de Informação (ORI)**, atendendo à restrição de não utilizar bancos de dados prontos (como SQLite ou MySQL) nem bibliotecas de alto nível para serialização. 
 
-Toda a manipulação dos dados é feita diretamente no disco de forma nativa por meio de arquivos binários estruturados, utilizando operações de baixo nível como `fseek`, `ftell`, `fread` e `fwrite`.
+Todos os dados e índices são manipulados por meio de ponteiros de disco nativos (`fseek`, `ftell`, `fread`, `fwrite`).
 
 ---
 
 ## 🛠️ Arquitetura e Estruturas de Dados
 
-O motor de banco de dados foi construído com base em registros de tamanho fixo em disco e índices persistidos para otimização de busca rápida.
+O sistema é composto por 4 arquivos principais e utiliza uma arquitetura baseada em registros de tamanho fixo com indexação primária (Árvore B) e secundária (Listas Invertidas com *Loosely Binding*).
 
 ### 1. Arquivo de Dados Principal (`ativos_inventario.bin`)
-- **Tamanho Fixo do Registro**: Cada registro da struct `Ativo` possui exatamente **88 bytes** em disco. O empacotamento é forçado com a diretiva `#pragma pack(push, 1)` para evitar o preenchimento de bytes extras pelo compilador (*padding*).
-- **Layout de Campos**:
-  - `int patrimonio_id` (4 bytes) — Chave Primária.
+- **Tamanho Fixo**: Cada registro da struct `Ativo` possui exatamente **88 bytes** em disco, forçado com a diretiva `#pragma pack(push, 1)`.
+- **Campos**:
+  - `int patrimonio_id` (4 bytes) — Chave Primária (imutável após a inserção).
   - `char tipo_equipamento[20]` (20 bytes).
   - `char setor_alocacao[20]` (20 bytes).
   - `char marca_modelo[40]` (40 bytes).
   - `float valor_compra` (4 bytes).
 
-### 2. Gerenciamento de Exclusão por LED (LIFO)
-Para evitar a fragmentação física e o custo de reorganização de arquivos, a deleção de registros é estritamente **lógica**. 
-- Os espaços vazios (buracos) são catalogados em uma **Lista de Espaços Disponíveis (LED)** operando como uma **Pilha LIFO** (Last-In, First-Out).
-- O cabeçalho do arquivo de dados (primeiros 4 bytes) armazena um inteiro contendo o RRN do topo da LED.
-- **Reaproveitamento de Espaço ($O(1)$)**: Quando um registro é removido, seu campo `patrimonio_id` passa a atuar como o ponteiro lógico para o próximo RRN da pilha LED. Para evitar colisões com IDs válidos (positivos), codificamos os ponteiros na LED como valores negativos:
+### 2. Gerenciamento de Espaço Livre (LED - Pilha LIFO)
+- A exclusão de ativos é **estritamente lógica**. O cabeçalho do arquivo de dados (primeiros 4 bytes) armazena um `int` correspondente ao RRN do topo da LED.
+- **Mapeamento de Remoção**: Quando um ativo é excluído, seu ID é codificado de forma negativa para marcar a exclusão e apontar para o próximo RRN livre na pilha:
   $$\text{patrimonio\_id} = -(\text{proximo\_rrn} + 2)$$
-- Nas novas inserções, o sistema verifica a LED. Se houver espaços vazios, o topo da pilha é desempilhado e o novo registro sobrescreve o RRN recuperado, atualizando o cabeçalho. Caso a LED esteja vazia, a gravação é feita por append no fim do arquivo físico.
+- Nas inserções, a LED é verificada: se houver buracos disponíveis, o espaço é reaproveitado na ordem LIFO ($O(1)$). Caso contrário, grava-se no final do arquivo físico.
 
-### 3. Indexação Primária com Árvore B em Disco
-Para eliminar a busca sequencial e possibilitar buscas com complexidade logarítmica ($O(\log N)$), implementamos um índice primário persistido no arquivo `ativos_index.btree`.
-- **Nós de Tamanho Fixo**: Cada nó da Árvore B (`NoArvoreB`) possui exatamente **57 bytes** estruturados em disco. O RRN da raiz da árvore fica armazenado nos primeiros 4 bytes do arquivo.
-- **Ordem $m = 5$**: Cada nó pode conter no máximo $4$ chaves e $5$ ponteiros para filhos.
-- **Cisão (Split) no Disco**: O algoritmo detecta quando o nó ultrapassa o limite de chaves, dividindo-o em dois nós (esquerda e direita) e promovendo a chave mediana. O processo é gravado no final do arquivo de índice e o cabeçalho é atualizado caso a raiz sofra divisão.
-- **Busca Otimizada**: O índice é navegado por leitura sob demanda na memória RAM nó por nó de forma iterativa.
+### 3. Índice Primário por Árvore B (`ativos_index.btree`)
+- Permite busca direta em complexidade logarítmica ($O(\log N)$).
+- **Nós de Tamanho Fixo**: Cada nó da Árvore B (`NoArvoreB`) possui exatamente **57 bytes** estruturados em disco, com ordem $m = 5$ (máximo de 4 chaves por nó).
+- **Compatibilidade Binária**: O layout em disco foi alinhado e ordenado de forma equivalente ao formato em C tradicional (`eh_folha` no offset 0 e `num_chaves` no offset 1), garantindo portabilidade.
+- **Remoção Lógica**: Quando um ativo é excluído, o RRN de dados correspondente é marcado como `-1` no nó da Árvore B correspondente.
 
-### 4. Indexação Secundária com Lista Invertida (Loosely Binding)
-Para buscas não-exclusivas (ex: busca por marca ou setor), o sistema implementa uma estrutura de **Lista Invertida Persistida** operando sob a estratégia **Loosely Binding** (Ligação Tardia).
-- O índice secundário guarda a chave de busca (ex: marca) e aponta para o ID de patrimônio (Chave Primária) correspondente na Lista Invertida.
-- Na hora de efetuar a consulta, o ID de patrimônio é obtido e a Árvore B é consultada para localizar o RRN físico exato do registro ativo. Essa estratégia evita que alterações físicas (mudanças de RRN devido a deleções ou reinserções) quebrem os índices secundários.
+### 4. Índices Secundários por Lista Invertida (Loosely Binding)
+- O sistema indexa **dois campos não exclusivos**: **Tipo** (`tipo_equipamento`) e **Setor** (`setor_alocacao`).
+- **Arquivos**:
+  - Setor: `setor_secundario.idx` e `setor_lista.bin`
+  - Tipo: `tipo_secundario.idx` e `tipo_lista.bin`
+- **Loosely Binding**: Os índices secundários associam os termos pesquisados (como `"TI"` ou `"Notebook"`) às suas chaves primárias correspondentes (`patrimonio_id`). Ao fazer a busca secundária, o ID é retornado e consultado na Árvore B para obter o RRN de dados real. Isso garante que desfragmentações físicas do disco não quebrem os índices secundários.
 
 ---
 
 ## 📂 Estrutura do Repositório
 
+O projeto foi unificado em C++ e consolidado em apenas **4 arquivos de código** para máxima clareza e facilidade de entendimento durante a explicação:
+
 ```bash
-├── arvore_b.hpp           # Cabeçalho da Árvore B (Structs, Busca, Inserção e Splits)
-├── main.cpp               # Motor principal contendo CRUD de Ativos e Gerenciador da LED
-├── teste_btree.cpp        # Testes unitários de inserções sequenciais e buscas na Árvore B
-└── README.md              # Documentação oficial do projeto
+├── ativos.h               # Estrutura do registro Ativo (88 bytes) e ajudantes de I/O em disco
+├── arvore_b.hpp           # Implementação da Árvore B em disco (busca, inserção, split e deleção lógica)
+├── lista_invertida.hpp    # Implementação de Listas Invertidas parametrizadas para múltiplos campos
+├── main.cpp               # Menu interativo CLI, LED, fluxo CRUD integrado e Vacuum
+└── README.md              # Esta documentação do projeto
 ```
 
 ---
 
 ## ⚙️ Compilação e Execução
 
-As instruções a seguir assumem o uso do compilador padrão GCC (`g++`) com suporte a C++17.
-
-### Compilando o CRUD e Motor de Dados Principal
+### Como compilar:
+Compile usando `g++` com otimização `-O3` e suporte ao padrão C++17:
 ```powershell
-g++ -O3 -std=c++17 main.cpp -o main.exe
+g++ -O3 -std=c++17 main.cpp -o SGBD.exe
 ```
 
-### Compilando o Módulo de Índice da Árvore B
+### Como executar:
 ```powershell
-g++ -O3 -std=c++17 teste_btree.cpp -o teste_btree.exe
-```
-
-### Executando os Sistemas
-Após a compilação bem-sucedida, você pode executar os binários gerados para simular os fluxos de persistência e indexação:
-
-```powershell
-# Executa os testes do arquivo de dados, LED (LIFO) e reaproveitamento de espaço
-.\main.exe
-
-# Executa as operações de inserção, split de nós e busca indexada na Árvore B
-.\teste_btree.exe
+.\SGBD.exe
 ```
 
 ---
 
-## 👨‍🎓 Critérios de Avaliação e Demonstrações Pedagógicas
+## 💎 Funcionalidades de Destaque
 
-O projeto foi planejado de forma a facilitar as explicações solicitadas nas avaliações teóricas do **Fator de Domínio**:
+### 🔄 CRUD Completo
+- **Inserir**: Checa se a chave é única e a insere no arquivo de dados, B-Tree e Índices Secundários.
+- **Buscar**: Busca extremamente rápida por ID (via Árvore B) ou por Tipo/Setor (via Listas Invertidas).
+- **Atualizar**: Altera os campos do ativo buscando-o pelo ID (imutável) e atualiza automaticamente os índices secundários se houver alteração de Tipo ou Setor.
+- **Remover**: Marca o registro como deletado em disco, insere o RRN na LED e invalida as referências na Árvore B e nas Listas Invertidas.
+
+### 🌪️ Desafio do Chefão: Vacuum (Desfragmentador + Reconstrução)
+O sistema possui a opção administrativa **Vacuum (Opção 9)** que executa a manutenção do banco de dados físico:
+1. Copia fisicamente apenas os registros válidos para um arquivo temporário de dados.
+2. Limpa completamente a LED (redefinindo o topo da pilha como `-1`).
+3. Reconstrói a Árvore B do zero com os novos RRNs compactados.
+4. Reconstrói as listas invertidas de Tipo e Setor apenas para registros ativos.
+5. Renomeia os arquivos para substituir a base fragmentada.
+
+---
+
+## 👨‍🎓 Demonstração para a Apresentação Oral
+Para explicar as lógicas solicitadas pelo professor na banca:
 - **Cálculo de Offsets**:
-  - Arquivo de Dados: $\text{Offset} = 4 + (\text{RRN} \times 88 \text{ bytes})$
-  - Arquivo de Índices: $\text{Offset} = 4 + (\text{RRN} \times 57 \text{ bytes})$
-- **Demonstração do Split no Disco**: A saída em tempo de execução no console exibe didaticamente como as partições folha e interna dividem e como a chave mediana é promovida de nível.
-- **Rastreabilidade da LED**: O depurador exibe em tempo real o encadeamento dos blocos lógicos deletados através de representações de offsets binários.
+  - Dados: $\text{Offset} = 4 + (\text{RRN} \times 88)$ bytes
+  - Árvore B: $\text{Offset} = 4 + (\text{RRN} \times 57)$ bytes
+- **LED Visual (Opção 7)**: Mostra como a pilha de registros excluídos armazena ponteiros negativos em disco.
+- **Árvore B Hierárquica (Opção 8)**: Imprime a estrutura de níveis em árvore com RRNs dos nós e chaves promovidas.
