@@ -22,12 +22,12 @@ O sistema é composto por 4 arquivos principais e utiliza uma arquitetura basead
 ### 2. Gerenciamento de Espaço Livre (LED - Pilha LIFO)
 - A exclusão de ativos é **estritamente lógica**. O cabeçalho do arquivo de dados (primeiros 4 bytes) armazena um `int` correspondente ao RRN do topo da LED.
 - **Mapeamento de Remoção**: Quando um ativo é excluído, seu ID é codificado de forma negativa para marcar a exclusão e apontar para o próximo RRN livre na pilha:
-  $$\text{patrimonio\_id} = -(\text{proximo\_rrn} + 2)$$
-- Nas inserções, a LED é verificada: se houver buracos disponíveis, o espaço é reaproveitado na ordem LIFO ($O(1)$). Caso contrário, grava-se no final do arquivo físico.
+  (patrimonio_id = proximo_rrn + 2)
+- Nas inserções, a LED é verificada: se houver buracos disponíveis, o espaço é reaproveitado na ordem LIFO (O(1)). Caso contrário, grava-se no final do arquivo físico.
 
 ### 3. Índice Primário por Árvore B (`ativos_index.btree`)
-- Permite busca direta em complexidade logarítmica ($O(\log N)$).
-- **Nós de Tamanho Fixo**: Cada nó da Árvore B (`NoArvoreB`) possui exatamente **57 bytes** estruturados em disco, com ordem $m = 5$ (máximo de 4 chaves por nó).
+- Permite busca direta em complexidade logarítmica (O(log N)).
+- **Nós de Tamanho Fixo**: Cada nó da Árvore B (`NoArvoreB`) possui exatamente **57 bytes** estruturados em disco, com ordem m = 5 (máximo de 4 chaves por nó).
 - **Compatibilidade Binária**: O layout em disco foi alinhado e ordenado de forma equivalente ao formato em C tradicional (`eh_folha` no offset 0 e `num_chaves` no offset 1), garantindo portabilidade.
 - **Remoção Lógica**: Quando um ativo é excluído, o RRN de dados correspondente é marcado como `-1` no nó da Árvore B correspondente.
 
@@ -90,7 +90,7 @@ O sistema possui a opção administrativa **Vacuum (Opção 9)** que executa a m
 ## 👨‍🎓 Demonstração para a Apresentação Oral
 Para explicar as lógicas solicitadas pelo professor na banca:
 - **Cálculo de Offsets**:
-  - Dados: $\text{Offset} = 4 + (\text{RRN} \times 88)$ bytes
-  - Árvore B: $\text{Offset} = 4 + (\text{RRN} \times 57)$ bytes
+  - Dados: Offset = 4 + RRN * 88 bytes
+  - Árvore B: $\text{Offset} = 4 + RRN * 57 bytes
 - **LED Visual (Opção 7)**: Mostra como a pilha de registros excluídos armazena ponteiros negativos em disco.
 - **Árvore B Hierárquica (Opção 8)**: Imprime a estrutura de níveis em árvore com RRNs dos nós e chaves promovidas.
