@@ -86,11 +86,3 @@ O sistema possui a opção administrativa **Vacuum (Opção 9)** que executa a m
 5. Renomeia os arquivos para substituir a base fragmentada.
 
 ---
-
-## 👨‍🎓 Demonstração para a Apresentação Oral
-Para explicar as lógicas solicitadas pelo professor na banca:
-- **Cálculo de Offsets**:
-  - Dados: Offset = 4 + RRN * 88 bytes
-  - Árvore B: $\text{Offset} = 4 + RRN * 57 bytes
-- **LED Visual (Opção 7)**: Mostra como a pilha de registros excluídos armazena ponteiros negativos em disco.
-- **Árvore B Hierárquica (Opção 8)**: Imprime a estrutura de níveis em árvore com RRNs dos nós e chaves promovidas.
